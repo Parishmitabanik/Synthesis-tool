@@ -1,0 +1,87 @@
+# 1. Physical Grid Configuration
+GRID 35 35
+
+# 2. Node Declarations (Vertices)
+NODE R1 dispense x1
+NODE R2 dispense x2
+NODE R3 dispense x3
+NODE R4 dispense x4
+NODE R5 dispense x5
+NODE R6 dispense x6
+NODE R7 dispense x7
+
+# Internal Mixing Nodes
+NODE M_L1_1 mix
+NODE M_L1_2 mix
+NODE M_L1_3 mix
+NODE M_L1_4 mix
+
+NODE M_L2_1 mix
+NODE M_L2_2 mix
+NODE M_L2_3 mix
+NODE M_L2_4 mix
+
+NODE M_L3_1 mix
+NODE M_L3_2 mix
+NODE M_L3_3 mix
+NODE M_L3_4 mix
+
+NODE M_L4_1 mix
+NODE M_L4_2 mix
+
+NODE M_ROOT mix
+NODE O1 output
+
+# 3. Directed Edge List (From Parents to Children)
+# --- Level 0 to Level 1 ---
+EDGE R2 M_L1_1
+EDGE R7 M_L1_1
+
+EDGE R1 M_L1_2
+EDGE R7 M_L1_2
+
+EDGE R4 M_L1_3
+EDGE R5 M_L1_3
+
+EDGE R3 M_L1_4
+EDGE R6 M_L1_4
+
+# --- Level 1 to Level 2 ---
+EDGE M_L1_1 M_L2_1
+EDGE R2 M_L2_1
+
+EDGE M_L1_2 M_L2_2
+EDGE R1 M_L2_2
+
+EDGE M_L1_3 M_L2_3
+EDGE R5 M_L2_3
+
+EDGE M_L1_4 M_L2_4
+EDGE R6 M_L2_4
+
+# --- Level 2 to Level 3 (Corrected: 4 mixing operations) ---
+EDGE M_L2_1 M_L3_1
+EDGE R2 M_L3_1
+
+EDGE M_L2_2 M_L3_2
+EDGE R1 M_L3_2
+
+EDGE M_L2_3 M_L3_3
+EDGE R4 M_L3_3
+
+EDGE M_L2_4 M_L3_4
+EDGE R3 M_L3_4
+
+# --- Level 3 to Level 4 ---
+EDGE M_L3_1 M_L4_1
+EDGE M_L3_2 M_L4_1
+
+EDGE M_L3_3 M_L4_2
+EDGE M_L3_4 M_L4_2
+
+# --- Level 4 to Level 5 (Root Target) ---
+EDGE M_L4_1 M_ROOT
+EDGE M_L4_2 M_ROOT
+
+# --- Final Output Port Delivery ---
+EDGE M_ROOT O1
