@@ -1,19 +1,17 @@
-GRID 30 30
-
 NODE R1 dispense x1
 NODE R2 dispense x2
 NODE R3 dispense x3
 NODE R4 dispense x4
 NODE R5 dispense x5
 
-NODE M_L1_1 mix
-NODE M_L1_2 mix
-NODE M_L2_1 mix
-NODE M_L2_2 mix
-NODE M_L2_3 mix
-NODE M_L3_1 mix
-NODE M_L3_2 mix
-NODE M_ROOT mix
+NODE M_L1_1 mix 12
+NODE M_L1_2 mix 12
+NODE M_L2_1 mix 18
+NODE M_L2_2 mix 12
+NODE M_L2_3 mix 12
+NODE M_L3_1 mix 18
+NODE M_L3_2 mix 18
+NODE M_ROOT mix 24
 NODE O1 output
 
 EDGE R3 M_L1_1
