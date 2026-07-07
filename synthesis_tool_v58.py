@@ -1,261 +1,175 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DMFB Synthesis Tool - Graph/DAG aware - SimBioSys compatible (rev3)
-- No dummy move(r,c,r,c)
-- True timestamps
-- mix_split time = seconds (multiple of 6) to satisfy Biochip_V
-- idle gap = mix_seconds
+Parallel-safe DMFB synthesis tool.
+
+Pipeline:
+1. Generate a verifier-safe baseline schedule using dmfb_synthesis_tool_reduced_cycles.py
+2. Compact that schedule with same-tick parallel moves using compact_from_safe.py
+   under the exact Biochip_V semantics.
+
+This version is intended for the user's SimBioSys/Biochip_V environment.
 """
 from __future__ import print_function
+import os
+import re
+import shutil
 import sys
-from collections import defaultdict, deque
 
-CYCLE_SEC = 6
+from dmfb_synthesis_tool_reduced_cycles import synthesize_graph as synthesize_safe
+from compact_from_safe import compact as compact_schedule
+from verify_biochipv import verify_dmfb
+from shadow_gui import check_file as shadow_gui_check
 
-def seconds_to_cycles(s):
-    return (s + CYCLE_SEC -1)//CYCLE_SEC or 1
 
-def bfs(src,dst,rows,cols,blocked):
-    from collections import deque
-    if dst in blocked: return []
-    if src==dst: return [src]
-    q=deque([(src,[src])]); vis={src}
-    while q:
-        (r,c),path=q.popleft()
-        for nr,nc in [(r-1,c),(r+1,c),(r,c-1),(r,c+1)]:
-            nxt=(nr,nc)
-            if nxt==dst: return path+[nxt]
-            if 1<=nr<=rows and 1<=nc<=cols and nxt not in vis and nxt not in blocked:
-                vis.add(nxt); q.append((nxt,path+[nxt]))
-    return []
+def _passes_all_checks(path, label):
+    """verify_dmfb only checks that the schedule is legal under
+    BiochipV's simplified fluidic-constraint model. That model treats an
+    active mixer as occupying just its two endpoint cells, but the real
+    Tkinter renderer (Biochip.py) physically walks a droplet through the
+    whole 1x4 / 4x1 zone between those endpoints for the entire mixing
+    duration, and its move_droplet()/dispense_droplet() have no
+    occupancy checks of their own - they just trust the schedule. A
+    schedule that is "legal" per verify_dmfb can still park or route an
+    unrelated droplet through that zone, which desyncs the two engines:
+    the GUI either raises (missing droplet at a move source) or leaves
+    an orphaned duplicate oval behind, and in both cases the droplet
+    that should have kept moving just stops. That is the stuck-droplet
+    freeze this project has hit before. shadow_gui.py replays the exact
+    sequential bookkeeping Biochip.py performs and catches this before
+    the file is ever handed to the real simulator.
+    """
+    try:
+        verify_dmfb(path)
+    except AssertionError as e:
+        print('[FAIL] {} failed verify_dmfb: {}'.format(label, e))
+        return False
+    if not shadow_gui_check(path):
+        print('[FAIL] {} would desync the Biochip.py GUI (see SHADOW-GUI FAIL above).'.format(label))
+        return False
+    return True
 
-def parse_arch(p):
-    rows=cols=15; res={}; waste={}; out={} 
-    with open(p) as f:
+
+_OP_RE = re.compile(r'[a-z_]+\s*\([\s*\d+\s*,\s*]+\s*\w+\s*\)')
+
+
+def _count_terminal_ops(path):
+    """Count waste(...) and output(...) instructions in a .dmfb file.
+
+    This is the completeness check that _looks_complete's timestamp-gap
+    heuristic cannot provide. A compactor can grind out instructions
+    right up until its tick budget runs out - e.g. two droplets stuck
+    livelocked, shuttling back and forth every tick near a chokepoint -
+    so the gap between the last emitted line and 'end' stays small even
+    though the assay never actually finished. Every individual emitted
+    move can be perfectly legal (passes verify_dmfb and shadow_gui) while
+    the schedule as a whole silently drops its final waste/output events.
+    Comparing terminal-op counts against the verified baseline catches
+    that: a parallel-compacted schedule may reorder/interleave freely,
+    but it must still perform the exact same set of terminal events as
+    the baseline it was compacted from.
+    """
+    waste = 0
+    output = 0
+    with open(path) as f:
         for line in f:
-            line=line.split('#',1)[0].strip()
-            if not line: continue
-            t=line.split(); k=t[0].upper()
-            if k=='GRID': rows,cols=int(t[1]),int(t[2])
-            elif k=='RESERVOIR': res[t[1]]=(int(t[2]),int(t[3]))
-            elif k=='WASTE': waste[t[1]]=(int(t[2]),int(t[3]))
-            elif k=='OUTPUT': out[t[1]]=(int(t[2]),int(t[3]))
-    return rows,cols,res,waste,out
+            s = line.strip()
+            if not s or s.endswith(' end'):
+                continue
+            for instr in _OP_RE.findall(line):
+                opcode = re.match(r'[a-z_]+', instr).group()
+                if opcode == 'waste':
+                    waste += 1
+                elif opcode == 'output':
+                    output += 1
+    return waste, output
 
-def parse_assay(p):
-    nodes={}; edges=[]
-    with open(p) as f:
+
+def _looks_complete(path):
+    """Sanity check beyond verify_dmfb: the schedule must not silently
+    stop early. verify_dmfb only checks that each executed instruction is
+    legal - it happily accepts a file that stops after 10% of the assay
+    and then jumps straight to 'N end'. That's exactly the bug that made
+    graph6/graph1/graph2a hang the GUI at a low clock value: the compactor
+    deadlocked, gave up, and stamped '3000 end' after the last real op.
+    We detect that shape here: a huge gap between the last real
+    instruction's timestamp and the terminal 'end' timestamp means the
+    file was abandoned, not finished.
+    """
+    last_op_t = 0
+    end_t = None
+    with open(path) as f:
         for line in f:
-            line=line.split('#',1)[0].strip()
-            if not line: continue
-            t=line.split(); k=t[0].upper()
-            if k=='NODE':
-                nid=t[1]; ntype=t[2].lower(); reagent=None; sec=None
-                if ntype=='dispense': reagent=t[3] if len(t)>3 else None
-                elif ntype=='mix': sec=int(t[3]) if len(t)>3 else None
-                nodes[nid]={'type':ntype,'reagent':reagent,'seconds':sec}
-            elif k=='EDGE': edges.append((t[1],t[2]))
-    return nodes,edges
+            s = line.strip()
+            if not s:
+                continue
+            if s.endswith(' end'):
+                end_t = int(s.split()[0])
+                continue
+            tok = s.split()
+            if tok and tok[0].isdigit():
+                last_op_t = int(tok[0])
+    if end_t is None:
+        return False
+    # A real schedule's 'end' marker sits right after the last operation
+    # (verify_dmfb requires end_t >= last op time; in practice it's within
+    # a handful of ticks). A gap of hundreds/thousands of ticks means the
+    # compactor bailed out and padded the rest with nothing.
+    return (end_t - last_op_t) < 50
 
-def build_graph(nodes,edges):
-    adj=defaultdict(list); inc=defaultdict(list); indeg={n:0 for n in nodes}
-    for a,b in edges:
-        adj[a].append(b); inc[b].append(a); indeg[b]=indeg.get(b,0)+1; indeg.setdefault(a,0)
-    return adj,indeg,inc
 
-def topo(nodes,adj,indeg):
-    from collections import deque
-    d=dict(indeg); q=deque(sorted([n for n in nodes if d.get(n,0)==0])); order=[]
-    while q:
-        n=q.popleft(); order.append(n)
-        for m in sorted(adj[n]):
-            d[m]-=1
-            if d[m]==0: q.append(m)
-    return order, len(order)==len(nodes)
+def synthesize_graph(arch_file, assay_file, output_file):
+    stage1 = output_file + '.stage1_safe.dmfb'
+    ok = synthesize_safe(arch_file, assay_file, stage1)
+    if not ok:
+        return False
 
-def main(arch,assay,out):
-    rows,cols,res,waste,outp=parse_arch(arch)
-    nodes,edges=parse_assay(assay)
-    adj,indeg,inc=build_graph(nodes,edges)
-    order,ok=topo(nodes,adj,indeg)
-    if not ok: print("cycle!"); return
-    # map reservoirs
-    res_coords={n:res[n] for n in order if nodes[n]['type']=='dispense' and n in res}
-    out_coords={}
-    for n in order:
-        if nodes[n]['type']!='output': continue
-        if n in outp: out_coords[n]=outp[n]
+    # verify the baseline itself before trusting it as a fallback target
+    if not _passes_all_checks(stage1, 'Baseline safe schedule'):
+        return False
+
+    compacted_ok = False
+    try:
+        compacted_ok = compact_schedule(stage1, output_file)
+    except Exception as e:
+        print('[WARN] Compaction raised an error ({}); falling back to baseline.'.format(e))
+        compacted_ok = False
+
+    if compacted_ok:
+        # Belt-and-suspenders: re-verify the compacted file end-to-end,
+        # make sure it isn't a truncated/deadlocked schedule padded out to
+        # a huge 'end' timestamp (see _looks_complete for why that
+        # matters), AND make sure it won't desync the real GUI engine.
+        if not _passes_all_checks(output_file, 'Compacted schedule'):
+            compacted_ok = False
+        elif not _looks_complete(output_file):
+            print('[WARN] Compacted schedule looks truncated (deadlocked mid-assay); falling back to baseline.')
+            compacted_ok = False
         else:
-            # take first free
-            free=[p for p in outp if p not in out_coords.values()]
-            # Actually outp keys are port IDs, simplify: use first output port
-            if outp: out_coords[n]=list(outp.values())[0]
-    # header
-    reagent_line=' '.join('reagent({},{},{})'.format(r,c,nodes[nid]['reagent'] or nid) for nid,(r,c) in res_coords.items())
-    header_extra=' '.join([' '.join('waste_reservoir({},{})'.format(r,c) for r,c in waste.values()),
-                          ' '.join('output_reservoir({},{})'.format(r,c) for r,c in outp.values())]).strip()
-    # mix ops
-    mix_ops=[]
-    for nid in order:
-        if nodes[nid]['type']=='mix':
-            ins=inc[nid]
-            if len(ins)==2:
-                sec=nodes[nid]['seconds'] or 6
-                mix_ops.append((ins[0],ins[1],nid,seconds_to_cycles(sec),sec))
-    # scheduler
-    cmds=defaultdict(list); droplet_pos=defaultdict(list); waste_drops=[]; t=1
-    res_lookup={nid:coord for nid,coord in res_coords.items()}
-    # add reagent name lookup
-    for nid,(r,c) in res_coords.items():
-        rn=nodes[nid]['reagent']
-        if rn: res_lookup[rn]=(r,c)
-    # no-park
-    no_park=set()
-    for pr,pc in list(res.values())+list(waste.values())+list(outp.values()):
-        for dr in (-1,0,1):
-            for dc in (-1,0,1):
-                no_park.add((pr+dr,pc+dc))
-    for src_a,src_b,dest,mix_cycles,mix_sec in mix_ops:
-        # dispense
-        to_disp=[s for s in (src_a,src_b) if not droplet_pos[s] and s in res_lookup]
-        if to_disp:
-            for s in to_disp:
-                rr,rc=res_lookup[s]
-                cmds[t].append('dispense({},{})'.format(rr,rc))
-                droplet_pos[s].append((rr,rc))
-            t+=1
-        if not droplet_pos[src_a] or not droplet_pos[src_b]:
-            print('missing',src_a,src_b); continue
-        pos_a=droplet_pos[src_a].pop(0); pos_b=droplet_pos[src_b].pop(0)
-        # find zone
-        zones=[]
-        for zc in range(2,cols):
-            for zr in range(2,rows-3):
-                a=(zr,zc); b=(zr+3,zc)
-                if a in no_park or b in no_park: continue
-                zones.append((zr,zc))
-        zones.sort(key=lambda z: abs(z[0]-pos_a[0])+abs(z[1]-pos_a[1])+abs(z[0]+3-pos_b[0])+abs(z[1]-pos_b[1]))
-        routed=False
-        for zr,zc in zones:
-            ta=(zr,zc); tb=(zr+3,zc)
-            others=[] 
-            for v in droplet_pos.values(): others.extend(v)
-            others.extend(waste_drops)
-            static=set()
-            for or_,oc in others:
-                if (or_,oc) in res.values(): continue
-                for dr in (-1,0,1):
-                    for dc in (-1,0,1):
-                        static.add((or_+dr,oc+dc))
-            def buf(cells):
-                s=set()
-                for rr,cc in cells:
-                    for dr in (-1,0,1):
-                        for dc in (-1,0,1):
-                            s.add((rr+dr,cc+dc))
-                return s
-            pa=bfs(pos_a,ta,rows,cols,static|buf([pos_b]))
-            pb=bfs(pos_b,tb,rows,cols,static|buf(pa))
-            if not pa or not pb:
-                pa=bfs(pos_a,tb,rows,cols,static|buf([pos_b]))
-                pb=bfs(pos_b,ta,rows,cols,static|buf(pa))
-                if pa and pb: ta,tb=tb,ta
-            if pa and pb:
-                # fluidic check
-                la,lb=len(pa),len(pb); ml=max(la,lb)
-                fa=pa+[ta]*(ml-la); fb=pb+[tb]*(ml-lb)
-                def close(p,q): return abs(p[0]-q[0])<=1 and abs(p[1]-q[1])<=1
-                ok=True
-                for i in range(ml):
-                    if close(fa[i],fb[i]): ok=False; break
-                    if i+1<ml and (close(fa[i+1],fb[i]) or close(fa[i],fb[i+1])): ok=False; break
-                if ok:
-                    routed=True; path_a=pa; path_b=pb; final_a=ta; final_b=tb; break
-        if not routed: print('routing fail',src_a,src_b); droplet_pos[src_a].insert(0,pos_a); droplet_pos[src_b].insert(0,pos_b); continue
-        # emit moves
-        steps=max(len(path_a),len(path_b))-1
-        for step in range(steps):
-            cmds_step=[]
-            if step+1 < len(path_a):
-                r1,c1=path_a[step]; r2,c2=path_a[step+1]; cmds_step.append('move({},{},{},{})'.format(r1,c1,r2,c2))
-            if step+1 < len(path_b):
-                r1,c1=path_b[step]; r2,c2=path_b[step+1]; cmds_step.append('move({},{},{},{})'.format(r1,c1,r2,c2))
-            if cmds_step:
-                cmds[t].extend(cmds_step); t+=1
-        r1,c1=final_a; r2,c2=final_b
-        mix_time_arg=mix_sec  # seconds, multiple of 6 for Biochip_V
-        cmds[t].append('mix_split({},{},{},{},{})'.format(r1,c1,r2,c2,mix_time_arg))
-        t+=1
-        t+=mix_time_arg  # idle
-        droplet_pos[dest].append((r1,c1))
-        # waste second droplet
-        post2=(r2,c2)
-        # try route waste
-        if waste:
-            # find nearest waste
-            others=[]
-            for v in droplet_pos.values(): others.extend(v)
-            others.extend(waste_drops)
-            static=set()
-            for or_,oc in others:
-                if (or_,oc) in res.values(): continue
-                for dr in (-1,0,1):
-                    for dc in (-1,0,1):
-                        static.add((or_+dr,oc+dc))
-            best=None
-            for wp in waste.values():
-                cand=bfs(post2,wp,rows,cols,static)
-                if cand and (best is None or len(cand)<len(best)): best=cand
-            if best:
-                for i in range(len(best)-1):
-                    a=best[i]; b=best[i+1]
-                    cmds[t].append('move({},{},{},{})'.format(a[0],a[1],b[0],b[1])); t+=1
-                cmds[t].append('waste({},{})'.format(best[-1][0],best[-1][1])); t+=1
-            else:
-                waste_drops.append(post2)
-        else:
-            waste_drops.append(post2)
-    # output routing
-    for nid in order:
-        if nodes[nid]['type']!='output': continue
-        srcs=inc[nid]
-        if not srcs: continue
-        src=srcs[0]
-        if not droplet_pos[src]: continue
-        start=droplet_pos[src].pop(0)
-        if nid not in out_coords: continue
-        target=out_coords[nid]
-        # bfs
-        others=[]
-        for v in droplet_pos.values(): others.extend(v)
-        others.extend(waste_drops)
-        static=set()
-        for or_,oc in others:
-            if (or_,oc) in res.values(): continue
-            for dr in (-1,0,1):
-                for dc in (-1,0,1):
-                    static.add((or_+dr,oc+dc))
-        path=bfs(start,target,rows,cols,static)
-        if path:
-            for i in range(len(path)-1):
-                a=path[i]; b=path[i+1]
-                cmds[t].append('move({},{},{},{})'.format(a[0],a[1],b[0],b[1])); t+=1
-            cmds[t].append('output({},{})'.format(path[-1][0],path[-1][1])); t+=1
-    # write
-    with open(out,'w') as f:
-        f.write('dimension {} {}\n'.format(rows,cols))
-        f.write('accuracy 5\n')
-        hdr=reagent_line + (' '+header_extra if header_extra else '')
-        f.write(hdr.strip()+'\n\n')
-        for ts in sorted(cmds):
-            if cmds[ts]:
-                f.write('{} {}\n'.format(ts,' '.join(cmds[ts])))
-        f.write('{} end\n'.format(t+1))
-    print('Wrote',out,'last',t+1)
+            baseline_terms = _count_terminal_ops(stage1)
+            compacted_terms = _count_terminal_ops(output_file)
+            if compacted_terms != baseline_terms:
+                print('[WARN] Compacted schedule is missing terminal operations '
+                      '(baseline waste/output={} vs compacted={}); the compactor '
+                      'likely livelocked and gave up before finishing the assay. '
+                      'Falling back to baseline.'.format(baseline_terms, compacted_terms))
+                compacted_ok = False
 
-if __name__=='__main__':
-    if len(sys.argv)<3:
-        print('usage: python synthesis_tool_v3.py arch assay [out]')
-        sys.exit(1)
-    main(sys.argv[1], sys.argv[2], sys.argv[3] if len(sys.argv)>3 else 'output.dmfb')
+    if not compacted_ok:
+        shutil.copyfile(stage1, output_file)
+        print('[SUCCESS] Verified safe (sequential) schedule compiled to: {}'.format(output_file))
+        print('[INFO] Parallel compaction was not possible for this assay/architecture combination,')
+        print('[INFO] so the verified-safe baseline schedule was used as-is instead of a broken one.')
+        return True
+
+    print('[SUCCESS] Parallel-safe compiled to: {}'.format(output_file))
+    print('[INFO] Baseline safe schedule kept at: {}'.format(stage1))
+    return True
+
+
+if __name__ == '__main__':
+    arch = sys.argv[1] if len(sys.argv) > 1 else 'arch6.txt'
+    assay = sys.argv[2] if len(sys.argv) > 2 else 'graph6.txt'
+    out = sys.argv[3] if len(sys.argv) > 3 else 'graph6_parallel_safe.dmfb'
+    ok = synthesize_graph(arch, assay, out)
+    sys.exit(0 if ok else 1)
