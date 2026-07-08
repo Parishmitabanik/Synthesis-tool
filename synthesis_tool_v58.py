@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 
 from dmfb_synthesis_tool_reduced_cycles import synthesize_graph as synthesize_safe
 from compact_from_safe import compact as compact_schedule
@@ -118,6 +119,16 @@ def _looks_complete(path):
     return (end_t - last_op_t) < 50
 
 
+def _end_tick(path):
+    """Return the tick number on the 'N end' line of a .dmfb file."""
+    with open(path) as f:
+        for line in f:
+            s = line.strip()
+            if s.endswith(' end'):
+                return int(s.split()[0])
+    return None
+
+
 def synthesize_graph(arch_file, assay_file, output_file):
     stage1 = output_file + '.stage1_safe.dmfb'
     ok = synthesize_safe(arch_file, assay_file, stage1)
@@ -128,43 +139,84 @@ def synthesize_graph(arch_file, assay_file, output_file):
     if not _passes_all_checks(stage1, 'Baseline safe schedule'):
         return False
 
-    compacted_ok = False
+    # compact_from_safe.compact() is a greedy, history-blind router: how
+    # much parallelism it actually finds is very sensitive to two knobs -
+    # DISPENSE_FRONTIER (how many not-yet-started mixes are allowed to
+    # pull their input reagents onto the chip at once) and MAX_ONCHIP (how
+    # many droplets are allowed on the chip concurrently). Too low and the
+    # router serializes independent branches of the assay for no reason;
+    # too high and it overcrowds the grid, droplets fight over the same
+    # lanes, and the router stalls/livelocks (caught by _passes_all_checks
+    # / _looks_complete / the terminal-op count below) or simply produces
+    # a *worse* schedule than a more modest setting. There's no closed-form
+    # best setting - it depends on the architecture's grid size and the
+    # assay's DAG shape - so instead of hand-picking one value we try a
+    # short list of candidates and keep whichever fully-verified result
+    # finishes in the fewest cycles. (1, 8) is the original conservative
+    # setting and is always included, so this can never do worse than the
+    # previous behaviour.
+    CANDIDATE_CONFIGS = [
+        (1, 8), (2, 8), (2, 9), (2, 10), (3, 8), (3, 10),
+        (4, 8), (4, 10), (5, 8), (5, 10), (6, 8), (6, 10),
+    ]
+
+    baseline_terms = _count_terminal_ops(stage1)
+    best_path = None
+    best_end_t = None
+    best_config = None
+
+    tmpdir = tempfile.mkdtemp(prefix='dmfb_compact_')
     try:
-        compacted_ok = compact_schedule(stage1, output_file)
-    except Exception as e:
-        print('[WARN] Compaction raised an error ({}); falling back to baseline.'.format(e))
-        compacted_ok = False
+        for dispense_frontier, max_onchip in CANDIDATE_CONFIGS:
+            cand_file = os.path.join(tmpdir, 'cand_{}_{}.dmfb'.format(dispense_frontier, max_onchip))
+            try:
+                ok = compact_schedule(stage1, cand_file, dispense_frontier=dispense_frontier, max_onchip=max_onchip)
+            except Exception as e:
+                print('[WARN] Compaction (frontier={}, onchip={}) raised an error ({}); skipping.'.format(
+                    dispense_frontier, max_onchip, e))
+                ok = False
 
-    if compacted_ok:
-        # Belt-and-suspenders: re-verify the compacted file end-to-end,
-        # make sure it isn't a truncated/deadlocked schedule padded out to
-        # a huge 'end' timestamp (see _looks_complete for why that
-        # matters), AND make sure it won't desync the real GUI engine.
-        if not _passes_all_checks(output_file, 'Compacted schedule'):
-            compacted_ok = False
-        elif not _looks_complete(output_file):
-            print('[WARN] Compacted schedule looks truncated (deadlocked mid-assay); falling back to baseline.')
-            compacted_ok = False
-        else:
-            baseline_terms = _count_terminal_ops(stage1)
-            compacted_terms = _count_terminal_ops(output_file)
+            if not ok:
+                continue
+            if not _passes_all_checks(cand_file, 'Compacted schedule (frontier={}, onchip={})'.format(
+                    dispense_frontier, max_onchip)):
+                continue
+            if not _looks_complete(cand_file):
+                print('[WARN] Compacted schedule (frontier={}, onchip={}) looks truncated; skipping.'.format(
+                    dispense_frontier, max_onchip))
+                continue
+            compacted_terms = _count_terminal_ops(cand_file)
             if compacted_terms != baseline_terms:
-                print('[WARN] Compacted schedule is missing terminal operations '
-                      '(baseline waste/output={} vs compacted={}); the compactor '
-                      'likely livelocked and gave up before finishing the assay. '
-                      'Falling back to baseline.'.format(baseline_terms, compacted_terms))
-                compacted_ok = False
+                print('[WARN] Compacted schedule (frontier={}, onchip={}) is missing terminal operations '
+                      '(baseline waste/output={} vs compacted={}); skipping.'.format(
+                          dispense_frontier, max_onchip, baseline_terms, compacted_terms))
+                continue
 
-    if not compacted_ok:
-        shutil.copyfile(stage1, output_file)
-        print('[SUCCESS] Verified safe (sequential) schedule compiled to: {}'.format(output_file))
-        print('[INFO] Parallel compaction was not possible for this assay/architecture combination,')
-        print('[INFO] so the verified-safe baseline schedule was used as-is instead of a broken one.')
+            end_t = _end_tick(cand_file)
+            print('[INFO] Candidate (frontier={}, onchip={}) verified OK, finishes at tick {}.'.format(
+                dispense_frontier, max_onchip, end_t))
+            if best_end_t is None or end_t < best_end_t:
+                best_end_t = end_t
+                best_config = (dispense_frontier, max_onchip)
+                # Copy out immediately since cand_file itself lives in the
+                # temp dir we're about to delete.
+                best_path = output_file + '.best_candidate.dmfb'
+                shutil.copyfile(cand_file, best_path)
+
+        if best_path is None:
+            shutil.copyfile(stage1, output_file)
+            print('[SUCCESS] Verified safe (sequential) schedule compiled to: {}'.format(output_file))
+            print('[INFO] Parallel compaction was not possible for this assay/architecture combination,')
+            print('[INFO] so the verified-safe baseline schedule was used as-is instead of a broken one.')
+            return True
+
+        shutil.move(best_path, output_file)
+        print('[SUCCESS] Parallel-safe compiled to: {} (frontier={}, onchip={}, finishes at tick {})'.format(
+            output_file, best_config[0], best_config[1], best_end_t))
+        print('[INFO] Baseline safe schedule kept at: {}'.format(stage1))
         return True
-
-    print('[SUCCESS] Parallel-safe compiled to: {}'.format(output_file))
-    print('[INFO] Baseline safe schedule kept at: {}'.format(stage1))
-    return True
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 if __name__ == '__main__':

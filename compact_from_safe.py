@@ -258,7 +258,7 @@ def occupied_positions(sim):
     return occ
 
 
-def compact(safe_dmfb, out_dmfb):
+def compact(safe_dmfb, out_dmfb, dispense_frontier=1, max_onchip=8):
     header, token_defs, mix_defs, child_mix = extract_skeleton(safe_dmfb)
     sim = init_sim_from_header(header)
 
@@ -283,8 +283,16 @@ def compact(safe_dmfb, out_dmfb):
     lines=[]
     t=1
     MAXT=3000
-    DISPENSE_FRONTIER = 1
-    MAX_ONCHIP = 8
+    # Tunable concurrency knobs. Higher values let more mixes'
+    # inputs be dispensed/routed at once and more droplets occupy
+    # the chip simultaneously, which is what actually lets
+    # independent branches of the assay DAG overlap in time instead
+    # of being serialized. synthesis_tool_v58.py now sweeps several
+    # (dispense_frontier, max_onchip) combinations and keeps the
+    # best one that still verifies cleanly, so these are just the
+    # conservative defaults used when compact() is called directly.
+    DISPENSE_FRONTIER = dispense_frontier
+    MAX_ONCHIP = max_onchip
     # STALL_LIMIT bounds how many consecutive "nothing scheduled" loop
     # iterations we tolerate before concluding the greedy router has
     # deadlocked (e.g. two mix operations whose baseline coordinates
