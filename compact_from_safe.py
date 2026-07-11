@@ -202,8 +202,9 @@ def pathfind_static(sim, src, dst):
     seen = {src}
     while q:
         cur, path = q.popleft()
-        for nr, nc in ((cur[0]-1,cur[1]),(cur[0]+1,cur[1]),(cur[0],cur[1]-1),(cur[0],cur[1]+1),
-                       (cur[0]-1,cur[1]-1),(cur[0]-1,cur[1]+1),(cur[0]+1,cur[1]-1),(cur[0]+1,cur[1]+1)):
+        # Manhattan-only: DMFB droplets can only step to one of the 4
+        # orthogonally-adjacent cells per tick, never diagonally.
+        for nr, nc in ((cur[0]-1,cur[1]),(cur[0]+1,cur[1]),(cur[0],cur[1]-1),(cur[0],cur[1]+1)):
             nxt = (nr, nc)
             if not (1 <= nr <= sim.row and 1 <= nc <= sim.col):
                 continue

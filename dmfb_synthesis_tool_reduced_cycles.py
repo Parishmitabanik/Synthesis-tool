@@ -82,9 +82,10 @@ def bfs_space_time(src, dst, start_t, rows, cols, rtab, overlay=None, max_path=M
         if len(path) > max_path:
             continue
         nt = ct + 1
+        # Manhattan-only: DMFB droplets can only step to one of the 4
+        # orthogonally-adjacent cells per tick, never diagonally.
         for nr, nc in (
-            (r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1),
-            (r - 1, c - 1), (r - 1, c + 1), (r + 1, c - 1), (r + 1, c + 1)
+            (r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)
         ):
             if not (1 <= nr <= rows and 1 <= nc <= cols):
                 continue
@@ -132,10 +133,28 @@ def line_for_reagents(rmeta):
 
 
 def parse_architecture(fp):
+    """Architecture files only declare the physical PRESENCE and LOCATION
+    of reservoir/waste/output sites on the chip - never which reagent (if
+    any) a reservoir will hold. That assignment is made per-run by the
+    synthesis tool from the assay being compiled (see map_arch), the same
+    way a microprocessor assigns registers per-program rather than the
+    hardware spec hardcoding them. So each keyword here takes only a
+    row/col pair, e.g.:
+
+        GRID 14 14
+        RESERVOIR 1 2
+        RESERVOIR 1 6
+        WASTE 14 2
+        OUTPUT 8 14
+
+    Order in the file is preserved (as plain lists) since that order is
+    what map_arch uses to assign sites to this assay's dispense/output
+    nodes.
+    """
     rows = cols = 15
-    reservoirs = {}
-    waste_ports = {}
-    output_ports = {}
+    reservoirs = []
+    waste_ports = []
+    output_ports = []
     with open(fp) as f:
         for raw in f:
             line = raw.split('#', 1)[0].strip()
@@ -146,11 +165,11 @@ def parse_architecture(fp):
             if kw == 'GRID':
                 rows, cols = int(parts[1]), int(parts[2])
             elif kw == 'RESERVOIR':
-                reservoirs[parts[1]] = (int(parts[2]), int(parts[3]))
+                reservoirs.append((int(parts[1]), int(parts[2])))
             elif kw == 'WASTE':
-                waste_ports[parts[1]] = (int(parts[2]), int(parts[3]))
+                waste_ports.append((int(parts[1]), int(parts[2])))
             elif kw == 'OUTPUT':
-                output_ports[parts[1]] = (int(parts[2]), int(parts[3]))
+                output_ports.append((int(parts[1]), int(parts[2])))
     return rows, cols, reservoirs, waste_ports, output_ports
 
 
@@ -202,16 +221,26 @@ def topo_sort(nodes, adj, ideg):
 
 
 def map_arch(nodes, order, reservoirs, outputs):
+    """Assign this assay's dispense/output nodes to physical sites.
+
+    reservoirs/outputs are now plain location lists (no reagent names
+    baked into the architecture file), so the assignment is made here,
+    dynamically, per assay - round-robin over the declared sites in the
+    order dispense/output nodes appear in topological order. This is the
+    synthesis tool's job, not the architecture file's.
+    """
     disp = [n for n in order if nodes[n]['type'] == 'dispense']
     out_ids = [n for n in order if nodes[n]['type'] == 'output']
-    rc = dict((n, reservoirs[n]) for n in disp if n in reservoirs)
+
+    rc = {}
+    if reservoirs:
+        for i, n in enumerate(disp):
+            rc[n] = reservoirs[i % len(reservoirs)]
+
     oc = {}
-    unused = [p for p in outputs if p not in out_ids]
-    for n in out_ids:
-        if n in outputs:
-            oc[n] = outputs[n]
-        elif unused:
-            oc[n] = outputs[unused.pop(0)]
+    if outputs:
+        for i, n in enumerate(out_ids):
+            oc[n] = outputs[i % len(outputs)]
     return rc, oc
 
 
@@ -461,17 +490,17 @@ def synthesize_graph(arch_file, assay_file, output_file):
     rc, oc = map_arch(nodes, order, reservoirs, output_ports)
     rmeta = dict((n, (r, c, nodes[n].get('reagent') or n)) for n, (r, c) in rc.items())
     rline = line_for_reagents(rmeta)
-    wh = ' '.join('waste_reservoir({},{})'.format(r, c) for (r, c) in waste_ports.values())
-    oh = ' '.join('output_reservoir({},{})'.format(r, c) for (r, c) in output_ports.values())
+    wh = ' '.join('waste_reservoir({},{})'.format(r, c) for (r, c) in waste_ports)
+    oh = ' '.join('output_reservoir({},{})'.format(r, c) for (r, c) in output_ports)
     header_extra = ' '.join(x for x in [wh, oh] if x).strip()
 
     if not waste_ports:
         print('[ERROR] No waste port defined')
         return False
-    waste_port = sorted(waste_ports.values())[0]
+    waste_port = sorted(waste_ports)[0]
 
     no_park_zone = set()
-    for pr, pc in list(reservoirs.values()) + list(waste_ports.values()) + list(output_ports.values()):
+    for pr, pc in list(reservoirs) + list(waste_ports) + list(output_ports):
         for dr in range(-2, 3):
             for dc in range(-2, 3):
                 no_park_zone.add((pr + dr, pc + dc))
@@ -504,8 +533,8 @@ def synthesize_graph(arch_file, assay_file, output_file):
             if len(srcs) != 2:
                 print('[ERROR] Mix node {} does not have exactly 2 inputs'.format(mid))
                 return False
-            sa = source_descriptor(srcs[0], nodes, parked_products, reservoirs)
-            sb = source_descriptor(srcs[1], nodes, parked_products, reservoirs)
+            sa = source_descriptor(srcs[0], nodes, parked_products, rc)
+            sb = source_descriptor(srcs[1], nodes, parked_products, rc)
             pa, pb = sa['pos'], sb['pos']
             # Reused physical zones are the reason compact_from_safe.py
             # could never parallelize this schedule: two mixes pinned to

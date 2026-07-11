@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# Greedy nearest-available-site placement
 """
 Parallel-safe DMFB synthesis tool.
 
